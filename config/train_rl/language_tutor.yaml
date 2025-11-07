@@ -14,8 +14,8 @@ teacher_model:
   model_name_or_path: "unsloth/Qwen3-4B-Instruct-2507"
   vllm:
     temperature: 1.0
-    max_length: 4000
-    max_num_seqs: 256
+    max_length: 2048
+    max_num_seqs: 128
     gpu_memory_utilization: 0.75  # Drastically reduced to avoid OOM
     number_of_gpus_per_instance: 1  # Use 1 GPU per instance
     max_number_of_instances: 2  # Limit to 2 instances total
@@ -27,8 +27,8 @@ student_model:
   model_name_or_path: "unsloth/Qwen3-4B-Instruct-2507"
   vllm:
     temperature: 0.6
-    max_length: 4000
-    max_num_seqs: 256
+    max_length: 2048
+    max_num_seqs: 128
     gpu_memory_utilization: 0.75  # Drastically reduced to avoid OOM
     number_of_gpus_per_instance: 1  # Use 1 GPU per instance
     max_number_of_instances: 2  # Limit to 2 instances total
