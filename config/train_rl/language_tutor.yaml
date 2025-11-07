@@ -18,10 +18,10 @@ teacher_model:
     max_num_seqs: 16
     gpu_memory_utilization: 0.75  # Drastically reduced to avoid OOM
     number_of_gpus_per_instance: 1  # Use 1 GPU per instance
-    max_number_of_instances: 2  # Limit to 2 instances total
-    load_and_unload: true
+    max_number_of_instances: 1  # Single instance to avoid overlap
+    load_and_unload: false      # Keep model loaded; reduces fragmentation
     use_v0: true
-    enforce_eager: false
+    enforce_eager: true         # Disable async output proc; lowers extra buffers
 
 student_model:
   model_name_or_path: "unsloth/Qwen3-4B-Instruct-2507"
@@ -31,11 +31,11 @@ student_model:
     max_num_seqs: 16
     gpu_memory_utilization: 0.75  # Drastically reduced to avoid OOM
     number_of_gpus_per_instance: 1  # Use 1 GPU per instance
-    max_number_of_instances: 2  # Limit to 2 instances total
-    load_and_unload: true
+    max_number_of_instances: 1  # Single instance
+    load_and_unload: false
     use_v0: false
-    from_0: false
-    enforce_eager: false
+    from_0: false               # Allocate from tail (GPU3 first if later scaled)
+    enforce_eager: true         # Keep buffers minimal
 
 judge_model:
   model_name_or_path: "google/gemini-2.5-flash-lite-preview-09-2025"
