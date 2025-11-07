@@ -1,7 +1,7 @@
 train:
-  number_of_problems_per_batch: 2  # Reduced from 16
-  num_samples_per_problem: 2  # Reduced from 8
-  per_device_train_batch_size: 1  # Batch size per GPU (with 4 GPUs, gradient_accumulation_steps = 2*2 / 1 / 4 = 1)
+  number_of_problems_per_batch: 1  # Minimal batch
+  num_samples_per_problem: 1  # Minimal samples (just 1 generation per problem)
+  per_device_train_batch_size: 1  # Batch size per GPU
   gradient_checkpointing: true  # CRITICAL: Reduces memory usage during training
   deepspeed_config_path: "config/deepspeed/zero3_4GPU.yaml"  # Use ZeRO-3 for better memory efficiency
 
@@ -15,10 +15,10 @@ teacher_model:
   vllm:
     temperature: 1.0
     max_length: 4000
-    max_num_seqs: 512
-    gpu_memory_utilization: 0.20  # Reduced from 0.30 - less memory per vLLM instance
+    max_num_seqs: 256
+    gpu_memory_utilization: 0.10  # Drastically reduced to avoid OOM
     number_of_gpus_per_instance: 1  # Use 1 GPU per instance
-    max_number_of_instances: -1
+    max_number_of_instances: 2  # Limit to 2 instances total
     load_and_unload: true
     use_v0: true
     enforce_eager: true
@@ -28,10 +28,10 @@ student_model:
   vllm:
     temperature: 0.6
     max_length: 4000
-    max_num_seqs: 512
-    gpu_memory_utilization: 0.20  # Reduced from 0.30 - less memory per vLLM instance
+    max_num_seqs: 256
+    gpu_memory_utilization: 0.10  # Drastically reduced to avoid OOM
     number_of_gpus_per_instance: 1  # Use 1 GPU per instance
-    max_number_of_instances: -1
+    max_number_of_instances: 2  # Limit to 2 instances total
     load_and_unload: true
     use_v0: false
 
