@@ -182,16 +182,40 @@ def main(cfg: RLModelTrainingConfig):
     # Training
     #############################################################################
 
+    # Compute gradient accumulation robustly. Ensure it's at least 1,
+    # and use ceil so small batches across multiple processes don't round to 0.
+    import math
+    effective_denominator = (
+        cfg.train.per_device_train_batch_size * max(1, accelerator.num_processes)
+    )
+    ga_steps = max(
+        1,
+        math.ceil(
+            (cfg.train.num_samples_per_problem * cfg.train.number_of_problems_per_batch)
+            / effective_denominator
+        ),
+    )
+
+    if ga_steps == 0:
+        # Extra guardrail (should never trigger due to max/ceil)
+        ga_steps = 1
+
+    logger.info(
+        "gradient_accumulation_steps computed as %d (samples_per_problem=%d, problems_per_batch=%d, per_device_batch=%d, processes=%d)",
+        ga_steps,
+        cfg.train.num_samples_per_problem,
+        cfg.train.number_of_problems_per_batch,
+        cfg.train.per_device_train_batch_size,
+        accelerator.num_processes,
+    )
+
     trainer = ClassroomGRPOTrainer(
         model=model_config.model_name_or_path,
         reward_funcs=[
             pedagogical_reward, # This is now our ONLY reward function
         ],
         args=ClassroomGRPOConfig(
-            gradient_accumulation_steps=cfg.train.num_samples_per_problem
-            * cfg.train.number_of_problems_per_batch
-            // cfg.train.per_device_train_batch_size
-            // accelerator.num_processes,
+            gradient_accumulation_steps=ga_steps,
             gradient_checkpointing=train_config.gradient_checkpointing,
             num_generations=cfg.train.num_samples_per_problem,
             per_device_train_batch_size=cfg.train.per_device_train_batch_size,

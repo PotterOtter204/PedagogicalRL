@@ -1,541 +1,304 @@
-This is a great project, and your plan to use `unsloth/Qwen3-4B-Instruct-2507` is excellent. It's a very strong model, and using it for both student and tutor will create a robust training environment.
-
-You are correct that your previous approach was limited by API calls. The key insight from the paper is to **run the entire multi-turn simulation locally and at high speed**, using a dedicated server (`vllm_server.py`) that hosts all the models (Tutor, Student, Judge, Reward).
-
-Let's walk through adapting the paper's repository, `eth-lre-pedagogicalrl`, step-by-step. We will port your language tutoring logic (prompts and judge) *into* their efficient server-based framework.
-
------
-
-### Step 1: Create Your Central Config File
-
-First, we'll create a single "brain" for your project. This YAML file will tell the server and trainer which models to load and which prompts to use.
-
-1.  **Create the File:** In the `config/train_rl/` directory, create a new file named `language_tutor.yaml`.
-
-2.  **Copy Template:** Copy the contents of `config/train_rl/7b.yaml` into your new `language_tutor.yaml` as a starting point.
-
-3.  **Edit `language_tutor.yaml`:** Make the following changes.
-
-      * **Set Models:** Change `teacher_model` and `student_model` to your Qwen model.
-      * **Set Judge Model:** Change `judge_model` to use OpenRouter. [cite\_start]This tells the `Classroom` to instantiate an API client [cite: 322, 329] instead of a local model.
-      * **Quantization:** The `7b.yaml` file might have `AWQ` or other quantization settings. **Remove them** to load the full fp16 model as you wanted.
-
-Here is what your `language_tutor.yaml` should look like:
-
-```yaml
-# config/train_rl/language_tutor.yaml
-
-train:
-  number_of_problems_per_batch: 16
-  num_samples_per_problem: 8
-  learning_rate: 5e-7
-  beta: 0.001
-  mu: 2
-
-teacher_model:
-  model_name_or_path: "unsloth/Qwen3-4B-Instruct-2507" # Your Tutor Model
-  vllm:
-    temperature: 1.0
-    max_length: 6144 # Match your max_seq_length
-    gpu_memory_utilization: 0.4 # Start with 0.4 for each model
-    # ... (other vllm settings from 7b.yaml)
-
-student_model:
-  model_name_or_path: "unsloth/Qwen3-4B-Instruct-2507" # Your Student Model
-  vllm:
-    temperature: 0.6
-    max_length: 6144
-    gpu_memory_utilization: 0.4 # Start with 0.4 for each model
-    # ... (other vllm settings from 7b.yaml)
-
-judge_model:
-  model_name_or_path: "google/gemini-2.5-flash-preview-09-2025" # Your API Judge
-  use_openrouter: true # <<< THIS IS THE KEY
-  vllm:
-    # Settings here are ignored because use_openrouter is true
-    temperature: 0.6
-
-reward_model:
-  model_name_or_path: "Answer" # We will replace this logic
-
-logging:
-  wandb: true
-  wandb_project: "language-tutor-rl"
-  wandb_run_name: "Qwen3-4B-GRPO-Run-1"
-  save_dir: checkpoints/language_tutor
-
-generation:
-  # We will fill these in the next step
-  teacher_prompt_path: "prompt_templates/teacher_language_prompt.txt"
-  student_personas_prompts_paths:
-    simple_student: "prompt_templates/personas/language_student.txt"
-  judges_rules_prompts_paths:
-    pedagogical_eval: "prompt_templates/judges/language_tutor_eval.txt"
-
-  # Penalty for low-scoring conversations
-  extra_penalty_for_rejected_judges: 0.25 
-  ignore_rejected_judge: true
-  use_experimental_shared_memory: false
-```
-
------
-
-### Step 2: Port Your Language Prompts
-
-[cite\_start]The paper's `Classroom` loads all prompts from text files [cite: 254-257]. We need to take the prompts from your `tutorgrpo.py` file and save them in the `prompt_templates/` directory.
-
-1.  **Tutor Prompt:**
-
-      * **Create:** `prompt_templates/teacher_language_prompt.txt`
-      * **Content:** Paste your tutor system prompt (from `_build_tutor_system_prompt`) into this file.
-
-2.  **Student Prompt:**
-
-      * **Create:** `prompt_templates/personas/language_student.txt`
-      * **Content:** Paste your student simulation prompt (from `simulate_student_response`) into this file.
-
-3.  **Judge Prompt:**
-
-      * **Create:** `prompt_templates/judges/language_tutor_eval.txt`
-      * **Content:** Paste your judge evaluation prompt (from `evaluate_tutor_performance`) into this file.
-
-**We're done with prompts\!** You already linked them in `language_tutor.yaml`. [cite\_start]Now, when the `Classroom` starts, it will automatically load these files and use your local Qwen student with your student prompt[cite: 254], solving your API bottleneck.
-
------
-
-### Step 3: Modify the Server to Use Your Judge & Reward
-
-This is the most important code change. We need to tell the `Classroom` how to parse your judge's *custom* JSON output and use the `final_reward` value.
-
-#### Part A: Edit `src/classroom.py`
-
-1.  **Import Your Parser:** Open `src/classroom.py`. At the top of the file, add the imports and the `parse_judge_output` function from your `tutorgrpo.py`.
-
-    ````python
-    # At the top of src/classroom.py
-    import re
-    import json
-
-    # Paste your function
-    def parse_judge_output(output: str) -> dict:
-        """
-        Parse judge output, calculate final reward score.
-        ... (rest of your function) ...
-        """
-        # Remove markdown code fences if present
-        cleaned = output.strip()
-        cleaned = re.sub(r'^```json\s*', '', cleaned)
-        cleaned = re.sub(r'\s*```$', '', cleaned)
-
-        # Parse JSON
-        scores = json.loads(cleaned)
-
-        # Calculate final reward
-        final_reward = (
-            0.4 * scores['task_final_score'] +
-            0.4 * scores['forward_progression_score'] +
-            0.2 * (scores['overall_momentum_score'] / 10.0)
-        )
-        scores['final_reward'] = round(final_reward, 4)
-        return scores
-    ````
-
-2.  **Store Your Reward:** In the `Conversation` class `__init__` method (around line 251), add a new attribute to store your reward:
-
-    ```python
-    class Conversation:
-        def __init__(
-            self,
-            # ... existing args ...
-        ):
-            # ... existing attributes ...
-            self.judge_decisions: Dict[str, list[JudgeResponse]] = {}
-            self.final_pedagogical_reward: float = 0.0 # <<< ADD THIS LINE
-            self.solutions: list[str] = []
-            # ... rest of init ...
-    ```
-
-3.  **Modify the Judge Loop:** Go to the `sample_conversations` method. Find the judge loop (starts around line 368). [cite\_start]We need to replace the logic inside [cite: 377-380] that parses the judge's response.
-
-      * Find this `try...except` block inside the loop:
-        ```python
-        # [cite_start]OLD CODE [cite: 377-380]
-        for (conv, _), response in zip(pending, responses):
-            for output in response.outputs:
-                try:
-                    # We only take stuff that is between { and }
-                    out_text = output.text[
-                        output.text.find("{") : output.text.rfind("}") + 1
-                    ].replace("\\", "")
-                    decision = JudgeResponse(
-                        **json.loads(out_text, strict=False)
-                    )
-                    valid_responses[conv].append(decision)
-                except Exception as e:
-                    continue
-        ```
-      * **Replace it** with this new logic that uses *your* parser:
-        ```python
-        # NEW CODE
-        for (conv, _), response in zip(pending, responses):
-            for output in response.outputs:
-                try:
-                    # Use your parser from tutorgrpo.py
-                    parsed_scores = parse_judge_output(output.text)
-                    
-                    # Store the reward directly on the conversation object
-                    conv.final_pedagogical_reward = parsed_scores.get('final_reward', 0.0)
-
-                    # [cite_start]The paper's logic checks for 'REJECT'[cite: 298].
-                    # We'll set our own 'failed_judges' flag if the score is low.
-                    if conv.final_pedagogical_reward < 0.3: # You can tune this threshold
-                         conv.failed_judges = True
-                    
-                    # We must add a dummy response to make the loop logic happy
-                    valid_responses[conv].append(
-                        JudgeResponse(reasoning=parsed_scores.get('forward_progression_reasoning', 'Parsed by custom func'), decision=JudgeDecision.OK)
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to parse judge output: {e} --- Output was: {output.text}")
-                    continue
-        ```
-
-4.  **Expose Your Reward:** The trainer needs a way to *get* this reward. [cite\_start]Add a new method to the `Classroom` class (at the very end, after `get_length_reward` [cite: 412]).
-
-    ```python
-    # Add this new method to the Classroom class in src/classroom.py
-    def get_pedagogical_reward(self, conversation: Conversation):
-        """
-        Returns the final_reward stored from our custom judge.
-        """
-        reward = conversation.final_pedagogical_reward
-        
-        # We can still apply the paper's penalty if the score was low
-        if conversation.failed_judges:
-            reward -= self.generation_cfg.extra_penalty_for_rejected_judges
-        
-        return max(reward, 0.0) # Ensure reward isn't negative
-    ```
-
-#### Part B: Edit `vllm_server.py`
-
-Now we just need to create an API endpoint so the trainer can call the `get_pedagogical_reward` function we just wrote.
-
-1.  [cite\_start]**Add Endpoint:** Open `vllm_server.py` and add this new function alongside the other `get_..._reward` functions [cite: 110-114].
-    ```python
-    # Add this to vllm_server.py
-    @app.post("/get_pedagogical_reward")
-    def get_pedagogical_reward(request: RewardRequest):
-        global classroom
-        conversations: list[Conversation] = [
-            classroom.get_conversation_by_text(c) for c in request.conversations
-        ]
-        # This calls the method we just wrote in classroom.py
-        rewards = [classroom.get_pedagogical_reward(c) for c in conversations]
-        return rewards
-    ```
-
------
-
-### Step 4: Modify the Trainer to Use Your Reward
-
-Finally, we tell the `ClassroomGRPOTrainer` to *only* use our new reward endpoint.
-
-1.  **Add Client Function:** Open `src/vllm/client.py`. Add the Python client for your new endpoint.
-
-    ```python
-    # Add this function to src/vllm/client.py
-    def get_pedagogical_reward(
-        conversations: List[str],
-        server_port: int = 8000,
-    ) -> List[float]:
-        server_url = f"http://localhost:{server_port}/get_pedagogical_reward"
-        response = requests.post(server_url, json={"conversations": conversations})
-        response.raise_for_status()
-        rewards = response.json()
-        return rewards
-    ```
-
-2.  **Add Wrapper:** Open `src/utils/utils.py`. Go to the "Reward wrappers" section (around line 666) and add a wrapper for your new function.
-
-    ```python
-    # Add this to the "Reward wrappers" section in src/utils/utils.py
-
-    # Add the import at the top of the section
-    from src.vllm.client import (
-        # ... existing imports ...
-        get_pedagogical_reward, # <<< ADD THIS
-    )
-
-    # Add the new wrapper function
-    def construct_pedagogical_reward_func(server_port: 8000):
-        def pedagogical_reward_func(completions, **kwargs):
-            return get_pedagogical_reward(conversations=completions, server_port=server_port)
-        return pedagogical_reward_func
-    ```
-
-3.  **Connect to Trainer:** Open `train_rl.py`. [cite\_start]Find the `main` function and locate the "Rewards" section [cite: 92-93].
-
-      * **Replace** the old reward constructors:
-        ```python
-        # [cite_start]OLD CODE [cite: 92-93]
-        end_rm_reward = construct_end_rm_reward_func(cfg.generation.server_port)
-        thinking_reward = construct_thinking_reward_func(cfg.generation.server_port)
-        end_of_conversation_reward = construct_end_of_conversation_reward_func(
-            cfg.generation.server_port
-        )
-        length_reward = construct_length_reward_func(cfg.generation.server_port)
-        ```
-      * **With your new one:**
-        ```python
-        # NEW CODE
-        # Import our new wrapper
-        from src.utils.utils import construct_pedagogical_reward_func
-
-        pedagogical_reward = construct_pedagogical_reward_func(cfg.generation.server_port)
-        ```
-      * Finally, in the `ClassroomGRPOTrainer` initialization just below that, change the `reward_funcs` list:
-      * **Replace this:**
-        ```python
-        # [cite_start]OLD CODE [cite: 93]
-        reward_funcs=[
-            end_rm_reward,
-            thinking_reward,
-            end_of_conversation_reward,
-            length_reward,
-        ],
-        ```
-      * **With this:**
-        ```python
-        # NEW CODE
-        reward_funcs=[
-            pedagogical_reward, # This is now our ONLY reward function
-        ],
-        ```
-
------
-
-### Step 5: Run Your Training
-
-You are now ready to go. The process is now split into two terminals, which is exactly what makes it so scalable.
-
-1.  **Set Environment Variables:**
-
-    ```bash
-    export OPENROUTER_API_KEY="sk-or-..."
-    export HF_TOKEN="hf_..."
-    ```
-
-2.  **Terminal 1: Start the vLLM Server**
-
-      * This process runs the simulation and hosts your models.
-
-    <!-- end list -->
-
-    ```bash
-    python vllm_server.py --config-name language_tutor.yaml
-    ```
-
-      * Wait for it to load all the models (your two Qwen models) and show it's listening on port 8005.
-
-3.  **Terminal 2: Start the Trainer**
-
-      * This process runs the RL update loop. It will connect to the server from Terminal 1.
-      * *For local testing (1 GPU):*
-        ```bash
-        accelerate launch --config_file config/deepspeed/1GPU.yaml \
-        train_rl.py --config-name language_tutor.yaml
-        ```
-      * *For production (e.g., 4 GPUs on RunPod):*
-        ```bash
-        accelerate launch --config_file config/deepspeed/zero3_4GPU.yaml \
-        train_rl.py --config-name language_tutor.yaml
-        ```
-
-That's it\! The trainer will now call the server, the server will run a full simulation *locally* using your two Qwen models, make *one* API call to your judge, parse the reward, and the trainer will perform its update. This perfectly matches the paper's architecture while using your custom tutoring logic.
-
-I have two different prompts for the student I set it to randomly make errors 20% of the time (LLms hate making errors so I find they almost never do if your prompt is make an error 20% of the time) if randomly chosen it uses the error prompt if not it uses the regular prompt
-
-That's a very sharp observation, and a clever way to handle the student simulation. LLMs absolutely have a strong "correctness" bias, and forcing errors via a separate prompt is the right way to get realistic, teachable moments.
-
-You're right, this changes our plan slightly, but for the better. We need to modify the `Classroom` to randomly select one of your two student prompts for *every student turn*.
-
-Let's update our step-by-step plan to include this new logic.
-
------
-
-### Step 1: Update Your Central Config File
-
-Let's modify the `language_tutor.yaml` file we created. We need to make it aware of *both* of your student prompts, not just one.
-
-1.  **Open `config/train_rl/language_tutor.yaml`**.
-2.  Find the `generation:` section.
-3.  Modify the `student_personas_prompts_paths:` block to be a dictionary containing *both* of your prompt file paths. [cite\_start]This key-value structure is supported by the code [cite: 123, 254-255].
-
-Here is the updated `generation:` section for your `language_tutor.yaml`:
-
-```yaml
-# config/train_rl/language_tutor.yaml
-
-generation:
-  teacher_prompt_path: "prompt_templates/teacher_language_prompt.txt"
-  
-  # NEW: We are now telling the config about both student prompts
-  student_personas_prompts_paths:
-    correct_student: "prompt_templates/personas/language_student_correct.txt"
-    error_student: "prompt_templates/personas/language_student_error.txt"
-
-  judges_rules_prompts_paths:
-    pedagogical_eval: "prompt_templates/judges/language_tutor_eval.txt"
-
-  # ... (rest of your generation config) ...
-```
-
------
-
-### Step 2: Port All Your Language Prompts
-
-This step is now slightly different. Instead of creating one student prompt file, we'll create two.
-
-1.  **Tutor Prompt:** (No change)
-
-      * **Create:** `prompt_templates/teacher_language_prompt.txt`
-      * **Content:** Paste your tutor system prompt.
-
-2.  **Student Prompts (Plural):**
-
-      * **Create (Correct):** `prompt_templates/personas/language_student_correct.txt`
-      * **Content:** Paste your *regular* student prompt (the one that tries to be correct).
-      * **Create (Error):** `prompt_templates/personas/language_student_error.txt`
-      * **Content:** Paste your *error* student prompt (the one that makes a realistic mistake).
-
-3.  **Judge Prompt:** (No change)
-
-      * **Create:** `prompt_templates/judges/language_tutor_eval.txt`
-      * **Content:** Paste your judge evaluation prompt.
-
------
-
-### Step 3: Modify `src/classroom.py` (The Core Logic)
-
-This is where we'll implement your 20% error logic. We need to change the `Conversation` class to load both prompts at the start and then randomly choose between them on every student turn.
-
-1.  **Add Imports:**
-
-      * Open `src/classroom.py`.
-      * At the top of the file, add `import random` (it's already there, but good to check) and your `parse_judge_output` function as we discussed.
-
-    <!-- end list -->
-
-    ```python
-    # At the top of src/classroom.py
-    import random # Already present
-    import re
-
-    # Paste your parser function
-    def parse_judge_output(output: str) -> dict:
-        # ... (your full function here) ...
-        return scores
-    ```
-
-2.  **Modify `Conversation.__init__`:**
-
-      * Find the `__init__` method of the `Conversation` class (around line 251).
-      * We need to **replace** the `self.student_persona` and `self.system_prompt_student` logic.
-      * **Find and delete** this block (around lines 254-255):
-        ```python
-        # DELETE THIS BLOCK
-        self.student_persona = list(
-            generation_cfg.student_personas_prompts_paths.keys()
-        )[
-            problem_hash
-            % len(list(generation_cfg.student_personas_prompts_paths.keys()))
-        ]
-        self.system_prompt_student = read_template(
-            generation_cfg.student_personas_prompts_paths[self.student_persona]
-        ).render(student_name=self.student_name, problem=problem)
-        ```
-      * **Add this new code** in its place. This will load *both* of your prompts using the keys we defined in `language_tutor.yaml`.
-        ```python
-        # ADD THIS NEW BLOCK
-        self.system_prompt_student_correct = read_template(
-            generation_cfg.student_personas_prompts_paths["correct_student"]
-        ).render(student_name=self.student_name, problem=problem)
-        self.system_prompt_student_error = read_template(
-            generation_cfg.student_personas_prompts_paths["error_student"]
-        ).render(student_name=self.student_name, problem=problem)
-
-        # We still need a default for other states (like final solution generation)
-        self.system_prompt_student = self.system_prompt_student_correct
-        ```
-      * While you're here, add the `final_pedagogical_reward` attribute as planned (around line 271, after `self.judge_decisions`):
-        ```python
-        self.judge_decisions: Dict[str, list[JudgeResponse]] = {}
-        self.final_pedagogical_reward: float = 0.0 # <<< ADD THIS
-        ```
-
-3.  **Modify `Conversation.get_conversation`:**
-
-      * Find this method (around line 280). This function is called *every time* a model needs to generate a response.
-      * We will modify the `STUDENT_TURN` logic to implement your 20% error chance.
-      * [cite\_start]**Find** the `elif self.state == ConversationState.STUDENT_TURN:` block[cite: 287].
-      * **Replace** the *entire* block:
-        ```python
-        # DELETE THIS BLOCK (around lines 287-288)
-        elif self.state == ConversationState.STUDENT_TURN:
-            # If this is the first message in a guided conversation...
-            if self.type == ConversationType.ATTEMPTED and len(self.conversation) == 0:
-                 return [
-                     {"role": "system", "content": self.system_prompt_student_attempt}
-                 ]
-            conversation = [
-                {"role": "system", "content": self.system_prompt_student}
-            ] + self._get_conversation_from_student_perspective()
-            return conversation
-        ```
-      * **Add this new block** in its place. This new logic performs the random choice *every time* it's the student's turn.
-        ```python
-        # ADD THIS NEW BLOCK
-        elif self.state == ConversationState.STUDENT_TURN:
-            # If this is the first message in an ATTEMPTED conversation (we keep this logic)
-            if self.type == ConversationType.ATTEMPTED and len(self.conversation) == 0:
-                 return [
-                     {"role": "system", "content": self.system_prompt_student_attempt}
-                 ]
-
-            # === YOUR NEW LOGIC: 20% ERROR CHANCE ===
-            make_error = random.random() < 0.20 # 20% chance
-            
-            if make_error:
-                system_prompt_to_use = self.system_prompt_student_error
-            else:
-                system_prompt_to_use = self.system_prompt_student_correct
-            # === END NEW LOGIC ===
-
-            conversation = [
-                {"role": "system", "content": system_prompt_to_use} # Use the randomly chosen prompt
-            ] + self._get_conversation_from_student_perspective()
-            return conversation
-        ```
-
-4.  **Modify Judge Loop:** (No change from last step)
-
-      * Go to the `sample_conversations` method. Find the judge loop (starts around line 368).
-      * [cite\_start]**Replace** the `try...except` block [cite: 377-380] with the new logic that uses your parser (as described in the previous step).
-
-5.  **Expose Reward:** (No change from last step)
-
-      * Add the new `get_pedagogical_reward` method to the `Classroom` class (at the very end).
-
------
-
-### Step 4: Modify Server & Trainer (No Change)
-
-The rest of the plan from our previous conversation is **exactly the same**. You do not need to change it.
-
-  * **Edit `vllm_server.py`:** Add your new `/get_pedagogical_reward` endpoint.
-  * **Edit `src/vllm/client.py`:** Add the `get_pedagogical_reward` client function.
-  * **Edit `src/utils/utils.py`:** Add the `construct_pedagogical_reward_func` wrapper.
-  * **Edit `train_rl.py`:** Change the `reward_funcs` list to *only* use `[pedagogical_reward]`.
-
-You have now successfully implemented your custom, randomized, dual-prompt student simulator inside the paper's high-performance architecture. The server will now handle this logic automatically during rollouts.
+oot@ec41299f5813:~/PedagogicalRL# bash start_rl_training.sh --config_file config/deepspeed/zero3_4GPU.yaml --config-name language_tutor
+[start_rl_training.sh] Launching VLLM server...
+curl: (7) Failed to connect to localhost port 8005 after 0 ms: Couldn't connect to server
+[start_rl_training.sh] Waiting for VLLM server...
+/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+curl: (7) Failed to connect to localhost port 8005 after 0 ms: Couldn't connect to server
+[start_rl_training.sh] Waiting for VLLM server...
+INFO 11-07 23:41:33 [__init__.py:239] Automatically detected platform cuda.
+curl: (7) Failed to connect to localhost port 8005 after 0 ms: Couldn't connect to server
+[start_rl_training.sh] Waiting for VLLM server...
+2025-11-07 23:41:38,336 | rank:0 | gpu_logger | INFO | GPU0: 447.8/23034.0 MB (1.9%) | RAM: 42.6/503.5 GB (8.5%) | Total GPUs: 4, using 1 per instance
+INFO:     Started server process [19805]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8005 (Press CTRL+C to quit)
+2025-11-07 23:41:38,628 | rank:0 | gpu_logger | INFO | GPU0: 447.8/23034.0 MB (1.9%) | RAM: 42.6/503.5 GB (8.5%) | Limiting number of instances to 1
+/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+INFO:     127.0.0.1:55778 - "GET /docs HTTP/1.1" 200 OK
+[start_rl_training.sh] VLLM server is up.
+[start_rl_training.sh] About to run:
+  accelerate   launch   --config_file   config/deepspeed/zero3_4GPU.yaml   train_rl.py   --config-name   language_tutor
+/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+INFO 11-07 23:41:44 [__init__.py:239] Automatically detected platform cuda.
+/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+W1107 23:41:48.374000 20046 torch/distributed/run.py:792] 
+W1107 23:41:48.374000 20046 torch/distributed/run.py:792] *****************************************
+W1107 23:41:48.374000 20046 torch/distributed/run.py:792] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed.
+W1107 23:41:48.374000 20046 torch/distributed/run.py:792] *****************************************
+/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+Worker on GPUs [0] initializing for task 'generate'...
+`torch_dtype` is deprecated! Use `dtype` instead!
+/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+INFO 11-07 23:41:57 [__init__.py:239] Automatically detected platform cuda.
+/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+INFO 11-07 23:41:57 [__init__.py:239] Automatically detected platform cuda.
+INFO 11-07 23:41:57 [__init__.py:239] Automatically detected platform cuda.
+INFO 11-07 23:41:57 [__init__.py:239] Automatically detected platform cuda.
+WARNING 11-07 23:41:59 [cuda.py:96] To see benefits of async output processing, enable CUDA graph. Since, enforce-eager is enabled, async output processor cannot be used
+INFO 11-07 23:41:59 [llm_engine.py:242] Initializing a V0 LLM engine (v0.8.3) with config: model='unsloth/Qwen3-4B-Instruct-2507', speculative_config=None, tokenizer='unsloth/Qwen3-4B-Instruct-2507', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, override_neuron_config=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=2048, download_dir=None, load_format=LoadFormat.AUTO, tensor_parallel_size=1, pipeline_parallel_size=1, disable_custom_all_reduce=False, quantization=None, enforce_eager=True, kv_cache_dtype=auto,  device_config=cuda, decoding_config=DecodingConfig(guided_decoding_backend='xgrammar', reasoning_backend=None), observability_config=ObservabilityConfig(show_hidden_metrics=False, otlp_traces_endpoint=None, collect_model_forward_time=False, collect_model_execute_time=False), seed=None, served_model_name=unsloth/Qwen3-4B-Instruct-2507, num_scheduler_steps=1, multi_step_stream_outputs=True, enable_prefix_caching=False, chunked_prefill_enabled=False, use_async_output_proc=False, disable_mm_preprocessor_cache=False, mm_processor_kwargs=None, pooler_config=None, compilation_config={"splitting_ops":[],"compile_sizes":[],"cudagraph_capture_sizes":[],"max_capture_size":0}, use_cached_outputs=False,
+INFO 11-07 23:42:00 [cuda.py:292] Using Flash Attention backend.
+INFO 11-07 23:42:01 [parallel_state.py:957] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, TP rank 0
+INFO 11-07 23:42:01 [model_runner.py:1110] Starting to load model unsloth/Qwen3-4B-Instruct-2507...
+WARNING 11-07 23:42:01 [utils.py:76] Qwen3ForCausalLM has no vLLM implementation, falling back to Transformers implementation. Some features may not be supported and performance may not be optimal.
+INFO 11-07 23:42:01 [transformers.py:118] Using Transformers backend.
+`torch_dtype` is deprecated! Use `dtype` instead!
+2025-11-07 23:42:01,615 | rank:1 | gpu_logger | INFO | GPU1: 818.9/23034.0 MB (3.6%) | RAM: 49.5/503.5 GB (9.8%) | Loading datasets from [{'name_or_path': 'rd211/Big-Math-RL-Verified-Filtered', 'split': 'train', 'ratio': 1.0}]
+INFO 11-07 23:42:01 [weight_utils.py:265] Using model weights format ['*.safetensors']
+2025-11-07 23:42:01,640 | rank:3 | gpu_logger | INFO | GPU3: 798.9/23034.0 MB (3.5%) | RAM: 49.4/503.5 GB (9.8%) | Loading datasets from [{'name_or_path': 'rd211/Big-Math-RL-Verified-Filtered', 'split': 'train', 'ratio': 1.0}]
+2025-11-07 23:42:01,645 | rank:2 | gpu_logger | INFO | GPU2: 818.9/23034.0 MB (3.6%) | RAM: 49.4/503.5 GB (9.8%) | Loading datasets from [{'name_or_path': 'rd211/Big-Math-RL-Verified-Filtered', 'split': 'train', 'ratio': 1.0}]
+2025-11-07 23:42:01,676 | rank:0 | gpu_logger | INFO | GPU0: 9504.0/23034.0 MB (41.3%) | RAM: 49.4/503.5 GB (9.8%) | Loading datasets from [{'name_or_path': 'rd211/Big-Math-RL-Verified-Filtered', 'split': 'train', 'ratio': 1.0}]
+Loading safetensors checkpoint shards:   0% Completed | 0/2 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards:  50% Completed | 1/2 [00:00<00:00,  2.41it/s]
+Loading safetensors checkpoint shards: 100% Completed | 2/2 [00:01<00:00,  1.55it/s]
+Loading safetensors checkpoint shards: 100% Completed | 2/2 [00:01<00:00,  1.63it/s]
+
+INFO 11-07 23:42:03 [loader.py:447] Loading weights took 1.46 seconds
+No validation datasets provided or an error occurred while loading them.
+Key 'eval_datasets' not in 'DatasetConfig'
+    full_key: dataset.eval_datasets
+    reference_type=DatasetConfig
+    object_type=DatasetConfig
+2025-11-07 23:42:03,446 | rank:1 | gpu_logger | INFO | GPU1: 818.9/23034.0 MB (3.6%) | RAM: 49.5/503.5 GB (9.8%) | Loaded 2 training examples
+num_proc must be <= 2. Reducing num_proc to 2 for dataset of size 2.
+[2025-11-07 23:42:03,449][datasets.arrow_dataset][WARNING] - num_proc must be <= 2. Reducing num_proc to 2 for dataset of size 2.
+No validation datasets provided or an error occurred while loading them.
+Key 'eval_datasets' not in 'DatasetConfig'
+    full_key: dataset.eval_datasets
+    reference_type=DatasetConfig
+    object_type=DatasetConfig
+2025-11-07 23:42:03,534 | rank:3 | gpu_logger | INFO | GPU3: 798.9/23034.0 MB (3.5%) | RAM: 49.5/503.5 GB (9.8%) | Loaded 2 training examples
+num_proc must be <= 2. Reducing num_proc to 2 for dataset of size 2.
+[2025-11-07 23:42:03,536][datasets.arrow_dataset][WARNING] - num_proc must be <= 2. Reducing num_proc to 2 for dataset of size 2.
+INFO 11-07 23:42:03 [model_runner.py:1146] Model loading took 7.5454 GiB and 2.401150 seconds
+No validation datasets provided or an error occurred while loading them.
+Key 'eval_datasets' not in 'DatasetConfig'
+    full_key: dataset.eval_datasets
+    reference_type=DatasetConfig
+    object_type=DatasetConfig
+2025-11-07 23:42:03,949 | rank:2 | gpu_logger | INFO | GPU2: 818.9/23034.0 MB (3.6%) | RAM: 49.5/503.5 GB (9.8%) | Loaded 2 training examples
+num_proc must be <= 2. Reducing num_proc to 2 for dataset of size 2.
+[2025-11-07 23:42:03,952][datasets.arrow_dataset][WARNING] - num_proc must be <= 2. Reducing num_proc to 2 for dataset of size 2.
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+INFO 11-07 23:42:05 [worker.py:267] Memory profiling takes 1.01 seconds
+INFO 11-07 23:42:05 [worker.py:267] the current vLLM instance can use total_gpu_memory (22.06GiB) x gpu_memory_utilization (0.75) = 16.54GiB
+INFO 11-07 23:42:05 [worker.py:267] model weights take 7.55GiB; non_torch_memory takes 0.04GiB; PyTorch activation peak memory takes 0.16GiB; the rest of the memory reserved for KV Cache is 8.80GiB.
+INFO 11-07 23:42:05 [executor_base.py:112] # cuda blocks: 4002, # CPU blocks: 1820
+INFO 11-07 23:42:05 [executor_base.py:117] Maximum concurrency for 2048 tokens per request: 31.27x
+No validation datasets provided or an error occurred while loading them.
+Key 'eval_datasets' not in 'DatasetConfig'
+    full_key: dataset.eval_datasets
+    reference_type=DatasetConfig
+    object_type=DatasetConfig
+2025-11-07 23:42:05,328 | rank:0 | gpu_logger | INFO | GPU0: 18614.0/23034.0 MB (80.8%) | RAM: 50.3/503.5 GB (10.0%) | Loaded 2 training examples
+num_proc must be <= 2. Reducing num_proc to 2 for dataset of size 2.
+[2025-11-07 23:42:05,331][datasets.arrow_dataset][WARNING] - num_proc must be <= 2. Reducing num_proc to 2 for dataset of size 2.
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading checkpoint shards:  50%|█████████████████████████████████████████████▌                                             | 1/2 [00:00<00:00,  1.13it/s]INFO 11-07 23:42:08 [llm_engine.py:448] init engine (profile, create kv cache, warmup model) took 4.94 seconds
+Loading checkpoint shards: 100%|███████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:02<00:00,  1.36s/it]
+Loading checkpoint shards: 100%|███████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:02<00:00,  1.29s/it]
+Loading checkpoint shards: 100%|███████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:02<00:00,  1.29s/it]
+Loading checkpoint shards: 100%|███████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:04<00:00,  2.38s/it]
+Loading checkpoint shards: 100%|███████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:07<00:00,  3.68s/it]
+Loading checkpoint shards: 100%|███████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:07<00:00,  3.68s/it]
+Loading checkpoint shards: 100%|███████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:07<00:00,  3.68s/it]
+Loading checkpoint shards:  50%|█████████████████████████████████████████████▌                                             | 1/2 [00:06<00:06,  6.06s/it]2025-11-07 23:42:19,110 | rank:2 | gpu_logger | INFO | GPU2: 8488.9/23034.0 MB (36.9%) | RAM: 63.7/503.5 GB (12.6%) | Node ID: 0, Process ID: 2, Number of processes: 4
+Error executing job with overrides: []
+Traceback (most recent call last):
+  File "/root/PedagogicalRL/train_rl.py", line 185, in main
+    trainer = ClassroomGRPOTrainer(
+              ^^^^^^^^^^^^^^^^^^^^^
+  File "/root/PedagogicalRL/src/grpo/trainer.py", line 418, in __init__
+    self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/trl/models/utils.py", line 390, in prepare_deepspeed
+    model, *_ = deepspeed.initialize(model=model, config=config_kwargs)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/deepspeed/__init__.py", line 188, in initialize
+    config_class = DeepSpeedConfig(config, mpu, mesh_device=mesh_device)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/deepspeed/runtime/config.py", line 752, in __init__
+    self._configure_train_batch_size()
+  File "/usr/local/lib/python3.12/dist-packages/deepspeed/runtime/config.py", line 940, in _configure_train_batch_size
+    self._batch_assertion()
+  File "/usr/local/lib/python3.12/dist-packages/deepspeed/runtime/config.py", line 880, in _batch_assertion
+    assert (train_batch > 0), f"Train batch size: {train_batch} has to be greater than 0"
+            ^^^^^^^^^^^^^^^
+AssertionError: Train batch size: 0 has to be greater than 0
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.
+2025-11-07 23:42:19,129 | rank:3 | gpu_logger | INFO | GPU3: 8468.9/23034.0 MB (36.8%) | RAM: 63.7/503.5 GB (12.6%) | Node ID: 0, Process ID: 3, Number of processes: 4
+Error executing job with overrides: []
+Traceback (most recent call last):
+  File "/root/PedagogicalRL/train_rl.py", line 185, in main
+    trainer = ClassroomGRPOTrainer(
+              ^^^^^^^^^^^^^^^^^^^^^
+  File "/root/PedagogicalRL/src/grpo/trainer.py", line 418, in __init__
+    self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/trl/models/utils.py", line 390, in prepare_deepspeed
+    model, *_ = deepspeed.initialize(model=model, config=config_kwargs)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/deepspeed/__init__.py", line 188, in initialize
+    config_class = DeepSpeedConfig(config, mpu, mesh_device=mesh_device)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/deepspeed/runtime/config.py", line 752, in __init__
+    self._configure_train_batch_size()
+  File "/usr/local/lib/python3.12/dist-packages/deepspeed/runtime/config.py", line 940, in _configure_train_batch_size
+    self._batch_assertion()
+  File "/usr/local/lib/python3.12/dist-packages/deepspeed/runtime/config.py", line 880, in _batch_assertion
+    assert (train_batch > 0), f"Train batch size: {train_batch} has to be greater than 0"
+            ^^^^^^^^^^^^^^^
+AssertionError: Train batch size: 0 has to be greater than 0
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.
+2025-11-07 23:42:19,360 | rank:1 | gpu_logger | INFO | GPU1: 8488.9/23034.0 MB (36.9%) | RAM: 63.9/503.5 GB (12.7%) | Node ID: 0, Process ID: 1, Number of processes: 4
+Error executing job with overrides: []
+Traceback (most recent call last):
+  File "/root/PedagogicalRL/train_rl.py", line 185, in main
+    trainer = ClassroomGRPOTrainer(
+              ^^^^^^^^^^^^^^^^^^^^^
+  File "/root/PedagogicalRL/src/grpo/trainer.py", line 418, in __init__
+    self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/trl/models/utils.py", line 390, in prepare_deepspeed
+    model, *_ = deepspeed.initialize(model=model, config=config_kwargs)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/deepspeed/__init__.py", line 188, in initialize
+    config_class = DeepSpeedConfig(config, mpu, mesh_device=mesh_device)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/deepspeed/runtime/config.py", line 752, in __init__
+    self._configure_train_batch_size()
+  File "/usr/local/lib/python3.12/dist-packages/deepspeed/runtime/config.py", line 940, in _configure_train_batch_size
+    self._batch_assertion()
+  File "/usr/local/lib/python3.12/dist-packages/deepspeed/runtime/config.py", line 880, in _batch_assertion
+    assert (train_batch > 0), f"Train batch size: {train_batch} has to be greater than 0"
+            ^^^^^^^^^^^^^^^
+AssertionError: Train batch size: 0 has to be greater than 0
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.
+Loading checkpoint shards: 100%|███████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:07<00:00,  3.97s/it]
+2025-11-07 23:42:21,276 | rank:0 | gpu_logger | INFO | GPU0: 17284.0/23034.0 MB (75.0%) | RAM: 65.7/503.5 GB (13.0%) | Node ID: 0, Process ID: 0, Number of processes: 4
+Error executing job with overrides: []
+Traceback (most recent call last):
+  File "/root/PedagogicalRL/train_rl.py", line 185, in main
+    trainer = ClassroomGRPOTrainer(
+              ^^^^^^^^^^^^^^^^^^^^^
+  File "/root/PedagogicalRL/src/grpo/trainer.py", line 418, in __init__
+    self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/trl/models/utils.py", line 390, in prepare_deepspeed
+    model, *_ = deepspeed.initialize(model=model, config=config_kwargs)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/deepspeed/__init__.py", line 188, in initialize
+    config_class = DeepSpeedConfig(config, mpu, mesh_device=mesh_device)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/deepspeed/runtime/config.py", line 752, in __init__
+    self._configure_train_batch_size()
+  File "/usr/local/lib/python3.12/dist-packages/deepspeed/runtime/config.py", line 940, in _configure_train_batch_size
+    self._batch_assertion()
+  File "/usr/local/lib/python3.12/dist-packages/deepspeed/runtime/config.py", line 880, in _batch_assertion
+    assert (train_batch > 0), f"Train batch size: {train_batch} has to be greater than 0"
+            ^^^^^^^^^^^^^^^
+AssertionError: Train batch size: 0 has to be greater than 0
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.
+W1107 23:42:21.728000 20046 torch/distributed/elastic/multiprocessing/api.py:897] Sending process 20367 closing signal SIGTERM
+W1107 23:42:21.729000 20046 torch/distributed/elastic/multiprocessing/api.py:897] Sending process 20368 closing signal SIGTERM
+W1107 23:42:21.729000 20046 torch/distributed/elastic/multiprocessing/api.py:897] Sending process 20369 closing signal SIGTERM
+E1107 23:42:22.044000 20046 torch/distributed/elastic/multiprocessing/api.py:869] failed (exitcode: 1) local_rank: 3 (pid: 20370) of binary: /usr/bin/python3.12
+Traceback (most recent call last):
+  File "/usr/local/bin/accelerate", line 7, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/accelerate/commands/accelerate_cli.py", line 50, in main
+    args.func(args)
+  File "/usr/local/lib/python3.12/dist-packages/accelerate/commands/launch.py", line 1220, in launch_command
+    deepspeed_launcher(args)
+  File "/usr/local/lib/python3.12/dist-packages/accelerate/commands/launch.py", line 906, in deepspeed_launcher
+    distrib_run.run(args)
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/run.py", line 909, in run
+    elastic_launch(
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/launcher/api.py", line 138, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/launcher/api.py", line 269, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+train_rl.py FAILED
+------------------------------------------------------------
+Failures:
+  <NO_OTHER_FAILURES>
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2025-11-07_23:42:21
+  host      : ec41299f5813
+  rank      : 3 (local_rank: 3)
+  exitcode  : 1 (pid: 20370)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================
+INFO 11-07 23:42:22 [worker.py:133] Sleep mode freed 21.06 GiB memory, 0.29 GiB memory is still in use.
+INFO 11-07 23:42:22 [executor_base.py:210] It took 14.113150 seconds to fall asleep.
+2025-11-07 23:42:22,794 | rank:0 | gpu_logger | INFO | GPU0: 736.9/23034.0 MB (3.2%) | RAM: 61.1/503.5 GB (12.1%) | All workers are now asleep.
+2025-11-07 23:42:22,795 | rank:0 | gpu_logger | INFO | GPU0: 736.9/23034.0 MB (3.2%) | RAM: 61.1/503.5 GB (12.1%) | Total GPUs: 4, using 1 per instance  
+root@ec41299f5813:~/PedagogicalRL# 2025-11-07 23:42:22,947 | rank:0 | gpu_logger | INFO | GPU0: 736.9/23034.0 MB (3.2%) | RAM: 60.7/503.5 GB (12.1%) | Limiting number of instances to 1
+/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+INFO 11-07 23:42:28 [__init__.py:239] Automatically detected platform cuda.
+Worker on GPUs [3] initializing for task 'generate'...
+`torch_dtype` is deprecated! Use `dtype` instead!
+INFO 11-07 23:42:42 [config.py:1780] Chunked prefill is enabled with max_num_batched_tokens=8192.
+WARNING 11-07 23:42:42 [cuda.py:96] To see benefits of async output processing, enable CUDA graph. Since, enforce-eager is enabled, async output processor cannot be used
+/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+INFO 11-07 23:42:49 [__init__.py:239] Automatically detected platform cuda.
+INFO 11-07 23:42:53 [core.py:61] Initializing a V1 LLM engine (v0.8.3) with config: model='unsloth/Qwen3-4B-Instruct-2507', speculative_config=None, tokenizer='unsloth/Qwen3-4B-Instruct-2507', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, override_neuron_config=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=2048, download_dir=None, load_format=LoadFormat.AUTO, tensor_parallel_size=1, pipeline_parallel_size=1, disable_custom_all_reduce=False, quantization=None, enforce_eager=True, kv_cache_dtype=auto,  device_config=cuda, decoding_config=DecodingConfig(guided_decoding_backend='xgrammar', reasoning_backend=None), observability_config=ObservabilityConfig(show_hidden_metrics=False, otlp_traces_endpoint=None, collect_model_forward_time=False, collect_model_execute_time=False), seed=None, served_model_name=unsloth/Qwen3-4B-Instruct-2507, num_scheduler_steps=1, multi_step_stream_outputs=True, enable_prefix_caching=False, chunked_prefill_enabled=True, use_async_output_proc=False, disable_mm_preprocessor_cache=False, mm_processor_kwargs=None, pooler_config=None, compilation_config={"splitting_ops":[],"compile_sizes":[],"cudagraph_capture_sizes":[],"max_capture_size":0}
+WARNING 11-07 23:42:54 [utils.py:2413] Methods determine_num_available_blocks,device_config,get_cache_block_size_bytes,initialize_cache not implemented in <vllm.v1.worker.gpu_worker.Worker object at 0x7f0291bc78f0>
+^C
+root@ec41299f5813:~/PedagogicalRL# ^C
+root@ec41299f5813:~/PedagogicalRL# INFO 11-07 23:42:54 [parallel_state.py:957] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, TP rank 0
+INFO 11-07 23:42:54 [cuda.py:221] Using Flash Attention backend on V1 engine.
+INFO 11-07 23:42:54 [gpu_model_runner.py:1258] Starting to load model unsloth/Qwen3-4B-Instruct-2507...
+WARNING 11-07 23:42:54 [utils.py:76] Qwen3ForCausalLM has no vLLM implementation, falling back to Transformers implementation. Some features may not be supported and performance may not be optimal.
+INFO 11-07 23:42:54 [transformers.py:118] Using Transformers backend.
+`torch_dtype` is deprecated! Use `dtype` instead!
+WARNING 11-07 23:42:54 [topk_topp_sampler.py:69] FlashInfer is not available. Falling back to the PyTorch-native implementation of top-p & top-k sampling. For the best performance, please install FlashInfer.
+INFO 11-07 23:42:55 [weight_utils.py:265] Using model weights format ['*.safetensors']
+Loading safetensors checkpoint shards:   0% Completed | 0/2 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards:  50% Completed | 1/2 [00:00<00:00,  2.32it/s]
+Loading safetensors checkpoint shards: 100% Completed | 2/2 [00:01<00:00,  1.58it/s]
+Loading safetensors checkpoint shards: 100% Completed | 2/2 [00:01<00:00,  1.66it/s]
+
+INFO 11-07 23:42:57 [loader.py:447] Loading weights took 1.46 seconds
+INFO 11-07 23:42:57 [gpu_model_runner.py:1273] Model loading took 7.5454 GiB and 2.725255 seconds
+INFO 11-07 23:42:59 [kv_cache_utils.py:578] GPU KV cache size: 53,696 tokens
+INFO 11-07 23:42:59 [kv_cache_utils.py:581] Maximum concurrency for 2,048 tokens per request: 26.22x
+INFO 11-07 23:42:59 [core.py:162] init engine (profile, create kv cache, warmup model) took 2.32 seconds
+INFO 11-07 23:43:00 [block_pool.py:264] Successfully reset prefix cache
+^C
+root@ec41299f5813:~/PedagogicalRL# ^C
+root@ec41299f5813:~/PedagogicalRL# INFO 11-07 23:43:08 [gpu_worker.py:81] Sleep mode freed 15.76 GiB memory, 0.31 GiB memory is still in use.
+INFO 11-07 23:43:08 [executor_base.py:210] It took 8.251864 seconds to fall asleep.
+2025-11-07 23:43:08,360 | rank:0 | gpu_logger | INFO | GPU0: 736.9/23034.0 MB (3.2%) | RAM: 74.2/503.5 GB (14.7%) | All workers are now asleep.
