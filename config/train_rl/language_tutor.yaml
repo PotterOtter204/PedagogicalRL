@@ -1,0 +1,81 @@
+train:
+  number_of_problems_per_batch: 2  # Reduced from 16
+  num_samples_per_problem: 2  # Reduced from 8
+
+  learning_rate: 5e-7
+  beta: 0.001
+  mu: 2
+
+teacher_model:
+  model_name_or_path: "unsloth/Qwen3-4B-Instruct-2507"
+  vllm:
+    temperature: 1.0
+    max_length: 4000  # Reduced from 12000 for faster testing
+    max_num_seqs: 512
+    gpu_memory_utilization: 0.20
+    number_of_gpus_per_instance: 2
+    max_number_of_instances: -1
+    load_and_unload: true
+    use_v0: true
+    enforce_eager: true
+
+student_model:
+  model_name_or_path: "unsloth/Qwen3-4B-Instruct-2507"
+  vllm:
+    temperature: 0.6
+    max_length: 4000  # Reduced from 12000
+    max_num_seqs: 512
+    gpu_memory_utilization: 0.20
+    number_of_gpus_per_instance: 2
+    max_number_of_instances: -1
+    load_and_unload: true
+    use_v0: false
+
+judge_model:
+  model_name_or_path: "google/gemini-2.5-flash-lite-preview-09-2025"
+  use_openrouter: true
+  vllm:
+    temperature: 0.6
+
+reward_model:
+  model_name_or_path: None # We only use judge-based pedagogical reward for language tutoring
+
+huggingface:
+  name: <huggingface_name>
+  push_to_hub: false
+
+logging:
+  wandb: true
+  wandb_project: train-rl
+  wandb_run_name: Qwen2.5-7B-Instruct-HardLambda1.0
+  run_group: 7b
+  wandb_tags: ["7b"]
+  save_dir: checkpoints/7b
+  save_steps: 10
+
+
+generation:
+  teacher_prompt_path: "prompt_templates/teacher_language_prompt.txt"
+  
+  # NEW: We are now telling the config about both student prompts
+  student_personas_prompts_paths:
+    correct_student: "prompt_templates/personas/language_student_correct.txt"
+    error_student: "prompt_templates/personas/language_student_error.txt"
+
+  judges_rules_prompts_paths:
+    pedagogical_eval: "prompt_templates/judges/language_tutor_eval.txt"
+  # Penalty for low-scoring conversations
+  extra_penalty_for_rejected_judges: 0.25 
+  ignore_rejected_judge: true
+  use_experimental_shared_memory: false
+  forced_conversation_type: "GUIDED"  # Always start with tutor for language learning
+  number_student_attempts: 0  # Skip final solution generation (not needed for language tutoring)
+  max_turns: 3  # ADD THIS - only 3 turns for initial test (tutor, student, tutor, student, tutor, student)
+
+
+dataset:
+  train_datasets:
+    - name_or_path: "rd211/Big-Math-RL-Verified-Filtered"
+      split: "train"
+      ratio: 1.0
+  max_train_examples: 2  # Just 2 examples for first test

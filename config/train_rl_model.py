@@ -100,7 +100,7 @@ class GenerationConfig:
     max_tokens_per_turn: int = 1024
     max_tokens_per_student_attempt: int = 3900  # A small buffer for the reward model.
     max_tokens_per_judge_attempt: int = 2048
-    tokenizer_to_use: str = "Qwen/Qwen2.5-7B-Instruct"
+    tokenizer_to_use: str = "unsloth/Qwen3-4B-Instruct-2507"
 
     # Number of attempts we will average over the final student generation.
     number_student_attempts: int = 8

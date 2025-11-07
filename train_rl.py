@@ -2,6 +2,8 @@ from datetime import timedelta
 from accelerate import Accelerator, InitProcessGroupKwargs
 from transformers.trainer_utils import get_last_checkpoint
 import os
+import json
+from pathlib import Path
 import hydra
 import wandb
 import torch
@@ -15,14 +17,10 @@ from datasets import Dataset
 from src.grpo.config import ClassroomGRPOConfig
 from src.grpo.trainer import ClassroomGRPOTrainer
 from src.utils.utils import (
-    construct_end_of_conversation_reward_func,
-    construct_end_rm_reward_func,
-    construct_length_reward_func,
-    construct_thinking_reward_func,
+    construct_pedagogical_reward_func,
     init_logger,
 )
 import warnings
-
 from utils.data import load_datasets
 
 warnings.filterwarnings("ignore")
@@ -86,26 +84,99 @@ def main(cfg: RLModelTrainingConfig):
     train_dataset, _ = load_datasets(data_config, cfg.seed)
     logger.info(f"Loaded {len(train_dataset)} training examples")
 
-    def apply_template(example):
-        problem = example["problem"]
+    plans_path = Path(__file__).resolve().parent / "generated_plans.json"
+    lesson_specs: list[str] = []
+
+    if plans_path.exists():
+        with plans_path.open(encoding="utf-8") as f:
+            plans_data = json.load(f)
+        long_term_plans = plans_data.get("long_term_plans", [])
+        detailed_plans = plans_data.get("lesson_plans_detailed", [])
+
+        def format_lesson_spec(goal_entry: dict[str, str], lesson_entry: dict[str, object]) -> str:
+            lines: list[str] = []
+
+            if goal_entry:
+                for idx in range(1, 8):
+                    item = goal_entry.get(str(idx))
+                    if item:
+                        lines.append(item)
+
+            if lesson_entry:
+                section_defs = [
+                    ("Production chunks", lesson_entry.get("production_chunks", [])),
+                    ("Comprehension chunks", lesson_entry.get("comprehension_chunks", [])),
+                    ("Standalone responses", lesson_entry.get("standalone_responses", [])),
+                ]
+                for header, items in section_defs:
+                    if not items:
+                        continue
+                    lines.append(f"{header}:")
+                    for chunk in items:
+                        chunk_text = chunk.get("chunk", "").strip()
+                        meaning = chunk.get("meaning")
+                        usage = chunk.get("usage_context")
+                        slot_fillers = chunk.get("slot_fillers") or []
+                        variations = chunk.get("variations") or []
+
+                        if chunk_text:
+                            descriptor = chunk_text
+                            if meaning:
+                                descriptor += f" — {meaning}"
+                            lines.append(f"- {descriptor}")
+                        if usage:
+                            lines.append(f"  Use: {usage}")
+                        if slot_fillers:
+                            lines.append(f"  Slot fillers: {', '.join(slot_fillers)}")
+                        if variations:
+                            lines.append(f"  Variations: {', '.join(variations)}")
+
+                roleplay_flow = (lesson_entry.get("roleplay_flow") or "").strip()
+                if roleplay_flow:
+                    lines.append("Roleplay flow: " + roleplay_flow.replace("→", "->"))
+
+            lines.append(
+                "Tutor instructions: Focus on these chunks, elicit production without giving answers, and move through the roleplay while adhering to the pedagogical rules."
+            )
+            return "\n".join(lines)
+
+        for goal_entry, lesson_entry in zip(long_term_plans, detailed_plans):
+            lesson_specs.append(format_lesson_spec(goal_entry or {}, lesson_entry or {}))
+
+        if not lesson_specs:
+            logger.warning("generated_plans.json loaded but contained no lesson specs; defaulting to dataset prompts only.")
+    else:
+        logger.warning("generated_plans.json not found; proceeding without embedded lesson plans.")
+
+    lesson_spec_count = len(lesson_specs)
+
+    def apply_template(example, idx):
+        base_problem = example["problem"]
         answer = example["answer"]
+
+        if lesson_spec_count:
+            plan_text = lesson_specs[idx % lesson_spec_count]
+            if base_problem:
+                problem = f"{plan_text}\n\nAdditional context: {base_problem}"
+            else:
+                problem = plan_text
+        else:
+            problem = base_problem
 
         return {"prompt": problem, "answer": answer}
 
     train_dataset: Dataset = train_dataset.map(
-        apply_template, num_proc=4, desc="Applying template"
+        apply_template,
+        num_proc=4,
+        with_indices=True,
+        desc="Applying template",
     )
 
     #############################################################################
     # Rewards
     #############################################################################
 
-    end_rm_reward = construct_end_rm_reward_func(cfg.generation.server_port)
-    thinking_reward = construct_thinking_reward_func(cfg.generation.server_port)
-    end_of_conversation_reward = construct_end_of_conversation_reward_func(
-        cfg.generation.server_port
-    )
-    length_reward = construct_length_reward_func(cfg.generation.server_port)
+    pedagogical_reward = construct_pedagogical_reward_func(cfg.generation.server_port)
 
     #############################################################################
     # Training
@@ -114,10 +185,7 @@ def main(cfg: RLModelTrainingConfig):
     trainer = ClassroomGRPOTrainer(
         model=model_config.model_name_or_path,
         reward_funcs=[
-            end_rm_reward,
-            thinking_reward,
-            end_of_conversation_reward,
-            length_reward,
+            pedagogical_reward, # This is now our ONLY reward function
         ],
         args=ClassroomGRPOConfig(
             gradient_accumulation_steps=cfg.train.num_samples_per_problem

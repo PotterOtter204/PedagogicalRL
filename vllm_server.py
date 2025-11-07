@@ -54,22 +54,9 @@ def sample_conversations(request: ConversationSampleRequest):
         )
 
     df_table = classroom.to_pd_latest()
-    rewards = [classroom.get_end_rm_reward(c) for c in conversations]
-    df_table["end_rm_reward"] = rewards
-    rewards = [classroom.get_thinking_reward(c) for c in conversations]
-    df_table["thinking_reward"] = rewards
-    rewards = [classroom.get_end_of_conversation_reward(c) for c in conversations]
-    df_table["end_of_conversation_reward"] = rewards
-    rewards = [classroom.get_length_reward(c) for c in conversations]
-    df_table["length_reward"] = rewards
-
-    # sum of all rewards
-    df_table["total_reward"] = (
-        df_table["end_rm_reward"]
-        + df_table["thinking_reward"]
-        + df_table["end_of_conversation_reward"]
-        + df_table["length_reward"]
-    )
+    rewards = [classroom.get_pedagogical_reward(c) for c in conversations]
+    df_table["pedagogical_reward"] = rewards
+    df_table["total_reward"] = rewards
     df_table = df_table.astype(str)
     if config.logging.wandb:
         wandb.log(
@@ -122,6 +109,14 @@ def get_length_reward(request: RewardRequest):
     rewards = [classroom.get_length_reward(c) for c in conversations]
     return rewards
 
+@app.post("/get_pedagogical_reward")
+def get_pedagogical_reward(request: RewardRequest):
+    global classroom
+    conversations: list[Conversation] = [
+        classroom.get_conversation_by_text(c) for c in request.conversations
+    ]
+    rewards = [classroom.get_pedagogical_reward(c) for c in conversations]
+    return rewards
 
 @app.get("/wait_batch")
 def wait_batch():

@@ -29,8 +29,38 @@ from src.utils.utils import check_equal, extract_answer
 from src.inference_providers.open_router_inference import OpenRouterInference
 from src.inference_providers.gemini_api_inference import GeminiInference
 import logging
+import random
 
 logger = logging.getLogger(__name__)
+
+def parse_judge_output(output: str) -> dict:
+    """
+    Parse judge output, calculate final reward score.
+
+    Args:
+        output: Raw string output from judge model (may include markdown code fences)
+
+    Returns:
+        Dict with parsed scores plus calculated 'final_reward'
+    """
+    # Remove markdown code fences if present
+    cleaned = output.strip()
+    cleaned = re.sub(r'^```json\s*', '', cleaned)
+    cleaned = re.sub(r'\s*```$', '', cleaned)
+
+    # Parse JSON
+    scores = json.loads(cleaned)
+
+    # Calculate final reward
+    final_reward = (
+        0.4 * scores['task_final_score'] +
+        0.4 * scores['forward_progression_score'] +
+        0.2 * (scores['overall_momentum_score'] / 10.0)
+    )
+
+    scores['final_reward'] = round(final_reward, 4)
+
+    return scores
 
 
 # Each conversation will have a small state machine to track the conversation state.
@@ -97,15 +127,17 @@ class Conversation:
             else forced_student_name
         )
 
-        self.student_persona = list(
-            generation_cfg.student_personas_prompts_paths.keys()
-        )[
-            problem_hash
-            % len(list(generation_cfg.student_personas_prompts_paths.keys()))
-        ]
-        self.system_prompt_student = read_template(
-            generation_cfg.student_personas_prompts_paths[self.student_persona]
+        self.system_prompt_student_correct = read_template(
+            generation_cfg.student_personas_prompts_paths["correct_student"]
         ).render(student_name=self.student_name, problem=problem)
+        self.system_prompt_student_error = read_template(
+            generation_cfg.student_personas_prompts_paths["error_student"]
+        ).render(student_name=self.student_name, problem=problem)
+
+        # We still need a default for other states (like final solution generation)
+        self.system_prompt_student = self.system_prompt_student_correct
+
+
         self.system_prompt_teacher = read_template(
             generation_cfg.teacher_prompt_path
         ).render(
@@ -128,6 +160,7 @@ class Conversation:
 
         self.judge_evaluation_type = None
         self.judge_decisions: Dict[str, list[JudgeResponse]] = {}
+        self.final_pedagogical_reward: float = 0.0 # <<< ADD THIS
         self.solutions: list[str] = []
         self.rewards: list[float] = []
 
@@ -200,9 +233,6 @@ class Conversation:
                 instance.state = ConversationState[state_val]
         elif state_val in ConversationState.__members__:
             instance.state = ConversationState[state_val]
-
-        # Restore student persona and name.
-        instance.student_persona = row.get("Student Persona", instance.student_persona)
 
         # Restore judge decisions.
         jd_data = row.get("Judge Decisions", {})
@@ -345,16 +375,25 @@ class Conversation:
             return conversation
 
         elif self.state == ConversationState.STUDENT_TURN:
-            # If this is the first message in a guided conversation we request the student to start the conversation
+            # If this is the first message in an ATTEMPTED conversation (we keep this logic)
             if self.type == ConversationType.ATTEMPTED and len(self.conversation) == 0:
                 return [
                     {"role": "system", "content": self.system_prompt_student_attempt}
                 ]
+
+            # === YOUR NEW LOGIC: 20% ERROR CHANCE ===
+            make_error = random.random() < 0.20 # 20% chance
+
+            if make_error:
+                system_prompt_to_use = self.system_prompt_student_error
+            else:
+                system_prompt_to_use = self.system_prompt_student_correct
+            # === END NEW LOGIC ===
+
             conversation = [
-                {"role": "system", "content": self.system_prompt_student}
+                {"role": "system", "content": system_prompt_to_use} # Use the randomly chosen prompt
             ] + self._get_conversation_from_student_perspective()
             return conversation
-
         elif self.state == ConversationState.JUDGE_TURN:
             remaining_judge_rules = list(
                 set(self.generation_cfg.judges_rules_prompts_paths.keys())
@@ -437,12 +476,14 @@ class Conversation:
         self.state = ConversationState.REWARD_TURN
 
     def get_solutions_for_reward(self):
+        # For language tutoring: we don't need special formatting for answer extraction
+        # The judge-based reward is the primary signal
         chats = [
             self.tokenizer.apply_chat_template(
                 [
                     {
                         "role": "system",
-                        "content": "Please reason step by step, and put your final answer within \\boxed{}.",
+                        "content": "You are evaluating a language learning conversation.",
                     },
                     {"role": "user", "content": self.problem},
                     {"role": "assistant", "content": solution},
@@ -455,12 +496,14 @@ class Conversation:
         return chats
 
     def get_initial_solutions_for_reward(self):
+        # For language tutoring: we don't need special formatting for answer extraction
+        # The judge-based reward is the primary signal
         chats = [
             self.tokenizer.apply_chat_template(
                 [
                     {
                         "role": "system",
-                        "content": "Please reason step by step, and put your final answer within \\boxed{}.",
+                        "content": "You are evaluating a language learning conversation.",
                     },
                     {"role": "user", "content": self.problem},
                     {"role": "assistant", "content": solution},
@@ -558,7 +601,6 @@ class Conversation:
                     "Answer": self.answer,
                     "Conversation": self.conversation,
                     "Type": self.type.name,
-                    "Student Persona": self.student_persona,
                     "Student Name": self.student_name,
                     "Judge Decisions": {
                         key: [
@@ -987,15 +1029,23 @@ class Classroom:
                 for (conv, _), response in zip(pending, responses):
                     for output in response.outputs:
                         try:
-                            # We only take stuff that is between { and }
-                            out_text = output.text[
-                                output.text.find("{") : output.text.rfind("}") + 1
-                            ].replace("\\", "")
-                            decision = JudgeResponse(
-                                **json.loads(out_text, strict=False)
+                            # Use your parser from tutorgrpo.py
+                            parsed_scores = parse_judge_output(output.text)
+
+                            # Store the reward directly on the conversation object
+                            conv.final_pedagogical_reward = parsed_scores.get('final_reward', 0.0)
+
+                            # The paper's logic checks for 'REJECT'[cite: 298].
+                            # We'll set our own 'failed_judges' flag if the score is low.
+                            if conv.final_pedagogical_reward < 0.3: # You can tune this threshold
+                                conv.failed_judges = True
+
+                            # We must add a dummy response to make the loop logic happy
+                            valid_responses[conv].append(
+                                JudgeResponse(reasoning=parsed_scores.get('forward_progression_reasoning', 'Parsed by custom func'), decision=JudgeDecision.OK)
                             )
-                            valid_responses[conv].append(decision)
                         except Exception as e:
+                            logger.warning(f"Failed to parse judge output: {e} --- Output was: {output.text}")
                             continue
 
             # For any conversation still missing valid responses, add default decisions.
@@ -1202,3 +1252,16 @@ class Classroom:
 
     def get_length_reward(self, conversation: Conversation):
         return conversation.get_length_reward()
+
+    # Add this new method to the Classroom class in src/classroom.py
+    def get_pedagogical_reward(self, conversation: Conversation):
+        """
+        Returns the final_reward stored from our custom judge.
+        """
+        reward = conversation.final_pedagogical_reward
+
+        # We can still apply the paper's penalty if the score was low
+        if conversation.failed_judges:
+            reward -= self.generation_cfg.extra_penalty_for_rejected_judges
+
+        return max(reward, 0.0) # Ensure reward isn't negative

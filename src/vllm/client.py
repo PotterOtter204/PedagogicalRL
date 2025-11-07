@@ -107,6 +107,19 @@ def get_length_reward(
     return rewards
 
 
+def get_pedagogical_reward(
+    conversations: List[str],
+    server_port: int = 8000,
+) -> List[float]:
+    server_url = f"http://localhost:{server_port}/get_pedagogical_reward"
+
+    response = requests.post(server_url, json={"conversations": conversations})
+    response.raise_for_status()
+
+    rewards = response.json()
+    return rewards
+
+
 ####################################################################################################
 
 

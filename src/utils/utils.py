@@ -6,7 +6,6 @@ import torch
 import psutil
 import logging
 import pynvml
-
 pynvml.nvmlInit()
 
 
@@ -151,9 +150,14 @@ from src.vllm.client import (
     get_end_of_conversation_reward,
     get_end_rm_reward,
     get_length_reward,
+    get_pedagogical_reward,
     get_thinking_reward,
 )
-
+# Add the new wrapper function
+def construct_pedagogical_reward_func(server_port: 8000):
+    def pedagogical_reward_func(completions, **kwargs):
+        return get_pedagogical_reward(conversations=completions, server_port=server_port)
+    return pedagogical_reward_func
 
 def construct_end_rm_reward_func(server_port: 8000):
     def end_rm_reward_func(completions, **kwargs):
