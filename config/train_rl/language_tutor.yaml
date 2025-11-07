@@ -15,25 +15,27 @@ teacher_model:
   vllm:
     temperature: 1.0
     max_length: 2048
-    max_num_seqs: 128
+    max_num_seqs: 16
     gpu_memory_utilization: 0.75  # Drastically reduced to avoid OOM
     number_of_gpus_per_instance: 1  # Use 1 GPU per instance
     max_number_of_instances: 2  # Limit to 2 instances total
     load_and_unload: true
     use_v0: true
-    enforce_eager: true
+    enforce_eager: false
 
 student_model:
   model_name_or_path: "unsloth/Qwen3-4B-Instruct-2507"
   vllm:
     temperature: 0.6
     max_length: 2048
-    max_num_seqs: 128
+    max_num_seqs: 16
     gpu_memory_utilization: 0.75  # Drastically reduced to avoid OOM
     number_of_gpus_per_instance: 1  # Use 1 GPU per instance
     max_number_of_instances: 2  # Limit to 2 instances total
     load_and_unload: true
     use_v0: false
+    from_0: false
+    enforce_eager: false
 
 judge_model:
   model_name_or_path: "google/gemini-2.5-flash-lite-preview-09-2025"
