@@ -16,7 +16,7 @@ teacher_model:
     temperature: 1.0
     max_length: 4000
     max_num_seqs: 256
-    gpu_memory_utilization: 0.10  # Drastically reduced to avoid OOM
+    gpu_memory_utilization: 0.75  # Drastically reduced to avoid OOM
     number_of_gpus_per_instance: 1  # Use 1 GPU per instance
     max_number_of_instances: 2  # Limit to 2 instances total
     load_and_unload: true
@@ -29,7 +29,7 @@ student_model:
     temperature: 0.6
     max_length: 4000
     max_num_seqs: 256
-    gpu_memory_utilization: 0.10  # Drastically reduced to avoid OOM
+    gpu_memory_utilization: 0.75  # Drastically reduced to avoid OOM
     number_of_gpus_per_instance: 1  # Use 1 GPU per instance
     max_number_of_instances: 2  # Limit to 2 instances total
     load_and_unload: true
