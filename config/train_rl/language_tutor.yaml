@@ -10,10 +10,10 @@ teacher_model:
   model_name_or_path: "unsloth/Qwen3-4B-Instruct-2507"
   vllm:
     temperature: 1.0
-    max_length: 4000  # Reduced from 12000 for faster testing
+    max_length: 4000
     max_num_seqs: 512
-    gpu_memory_utilization: 0.20
-    number_of_gpus_per_instance: 2
+    gpu_memory_utilization: 0.30  # Increased slightly
+    number_of_gpus_per_instance: 1  # Use 1 GPU per instance
     max_number_of_instances: -1
     load_and_unload: true
     use_v0: true
@@ -23,10 +23,10 @@ student_model:
   model_name_or_path: "unsloth/Qwen3-4B-Instruct-2507"
   vllm:
     temperature: 0.6
-    max_length: 4000  # Reduced from 12000
+    max_length: 4000
     max_num_seqs: 512
-    gpu_memory_utilization: 0.20
-    number_of_gpus_per_instance: 2
+    gpu_memory_utilization: 0.30  # Increased slightly
+    number_of_gpus_per_instance: 1  # Use 1 GPU per instance
     max_number_of_instances: -1
     load_and_unload: true
     use_v0: false
