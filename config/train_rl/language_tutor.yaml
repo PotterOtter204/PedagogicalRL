@@ -36,6 +36,13 @@ judge_model:
   use_openrouter: true
   vllm:
     temperature: 0.6
+    max_length: 12000  # ADD: Judge needs full context
+    max_num_seqs: 512   # ADD: From default config
+    gpu_memory_utilization: 0.325  # ADD: Not used for API but keep consistent
+    number_of_gpus_per_instance: 4  # ADD: Not used for API but keep consistent
+    max_number_of_instances: -1  # ADD: From default config
+    load_and_unload: false  # ADD: Judge stays loaded (but you're using API so doesn't matter)
+    use_v0: false  # ADD: From default config
 
 reward_model:
   model_name_or_path: None # We only use judge-based pedagogical reward for language tutoring
@@ -47,35 +54,32 @@ huggingface:
 logging:
   wandb: true
   wandb_project: train-rl
-  wandb_run_name: Qwen2.5-7B-Instruct-HardLambda1.0
-  run_group: 7b
-  wandb_tags: ["7b"]
-  save_dir: checkpoints/7b
+  wandb_run_name: Language-Tutor-Test-Run  # CHANGED: More descriptive
+  run_group: language_tutor  # CHANGED: From "7b"
+  wandb_tags: ["language_tutor", "test", "4b"]  # CHANGED: More relevant tags
+  save_dir: checkpoints/language_tutor  # CHANGED: Separate checkpoint dir
   save_steps: 10
-
 
 generation:
   teacher_prompt_path: "prompt_templates/teacher_language_prompt.txt"
   
-  # NEW: We are now telling the config about both student prompts
   student_personas_prompts_paths:
     correct_student: "prompt_templates/personas/language_student_correct.txt"
     error_student: "prompt_templates/personas/language_student_error.txt"
 
   judges_rules_prompts_paths:
     pedagogical_eval: "prompt_templates/judges/language_tutor_eval.txt"
-  # Penalty for low-scoring conversations
+  
   extra_penalty_for_rejected_judges: 0.25 
-  ignore_rejected_judge: true
+  ignore_rejected_judge: true  # Soft penalty approach
   use_experimental_shared_memory: false
-  forced_conversation_type: "GUIDED"  # Always start with tutor for language learning
-  number_student_attempts: 0  # Skip final solution generation (not needed for language tutoring)
-  max_turns: 3  # ADD THIS - only 3 turns for initial test (tutor, student, tutor, student, tutor, student)
-
+  forced_conversation_type: "GUIDED"
+  number_student_attempts: 0
+  max_turns: 3
 
 dataset:
   train_datasets:
     - name_or_path: "rd211/Big-Math-RL-Verified-Filtered"
       split: "train"
       ratio: 1.0
-  max_train_examples: 2  # Just 2 examples for first test
+  max_train_examples: 2
