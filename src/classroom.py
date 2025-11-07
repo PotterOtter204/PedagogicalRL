@@ -777,8 +777,9 @@ class Classroom:
             # guided_decoding=guided_decoding_params
         )
 
+        # vLLM requires n >= 1; guard against zero in config
         self.sampling_params_student_solution = SamplingParams(
-            n=generation_cfg.number_student_attempts,
+            n=max(1, generation_cfg.number_student_attempts),
             temperature=student_model_cfg.vllm.temperature,
             top_k=student_model_cfg.vllm.top_k,
             top_p=student_model_cfg.vllm.top_p,
