@@ -56,7 +56,7 @@ huggingface:
   push_to_hub: false
 
 logging:
-  wandb: true
+  wandb: false
   wandb_project: train-rl
   wandb_run_name: Language-Tutor-Test-Run  # CHANGED: More descriptive
   run_group: language_tutor  # CHANGED: From "7b"
