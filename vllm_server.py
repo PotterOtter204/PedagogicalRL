@@ -216,6 +216,7 @@ def _initialize_classroom(cfg: RLModelTrainingConfig):
         ready_event.set()
 
 
+@hydra.main(config_path="config/train_rl", version_base=None)
 def main(cfg: RLModelTrainingConfig):
     global classroom, config
 
